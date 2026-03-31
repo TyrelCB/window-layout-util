@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/window-layouts"
+CURRENT_WINDOWS_JSON='[]'
+USED_WINDOWS_JSON='[]'
+CANDIDATE_REASON=''
+CANDIDATE_ID=''
+
+usage() {
+  cat <<'EOF'
+Usage:
+  window-layout save [name]
+  window-layout restore [--dry-run] [name]
+  window-layout list
+  window-layout path [name]
+
+Notes:
+  - Snapshots are stored in ~/.local/state/window-layouts by default.
+  - This script targets X11 sessions and uses xdotool/xprop/jq.
+  - Pop Shell auto-tiling can override manual geometry. Restore works best
+    with floating/manual windows, or after temporarily toggling tiling off.
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+require_prereqs() {
+  require_cmd jq
+  require_cmd xdotool
+  require_cmd xprop
+  require_cmd base64
+}
+
+layout_file() {
+  local name="${1:-default}"
+  printf '%s/%s.json\n' "$STATE_DIR" "$name"
+}
+
+window_ids() {
+  xprop -root _NET_CLIENT_LIST_STACKING 2>/dev/null | grep -oE '0x[0-9a-f]+'
+}
+
+current_desktop() {
+  xprop -root _NET_CURRENT_DESKTOP 2>/dev/null | sed -En 's/.*= ([0-9]+).*/\1/p'
+}
+
+window_exists() {
+  xprop -id "$1" >/dev/null 2>&1
+}
+
+should_skip_type() {
+  case "${1:-}" in
+    *"_NET_WM_WINDOW_TYPE_DESKTOP"*|\
+    *"_NET_WM_WINDOW_TYPE_DOCK"*|\
+    *"_NET_WM_WINDOW_TYPE_NOTIFICATION"*|\
+    *"_NET_WM_WINDOW_TYPE_MENU"*|\
+    *"_NET_WM_WINDOW_TYPE_DROPDOWN_MENU"*|\
+    *"_NET_WM_WINDOW_TYPE_POPUP_MENU"*|\
+    *"_NET_WM_WINDOW_TYPE_TOOLTIP"*|\
+    *"_NET_WM_WINDOW_TYPE_SPLASH"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+collect_windows_json() {
+  local tmp
+  tmp=$(mktemp)
+
+  local wid props geom title type state class_line instance class desktop pid
+  local maximized fullscreen hidden
+  local WINDOW X Y WIDTH HEIGHT SCREEN
+
+  while read -r wid; do
+    [ -n "$wid" ] || continue
+
+    props=$(xprop -id "$wid" \
+      WM_CLASS \
+      _NET_WM_DESKTOP \
+      _NET_WM_PID \
+      _NET_WM_STATE \
+      _NET_WM_WINDOW_TYPE 2>/dev/null || true)
+    geom=$(xdotool getwindowgeometry --shell "$wid" 2>/dev/null || true)
+    title=$(xdotool getwindowname "$wid" 2>/dev/null || true)
+
+    [ -n "$props" ] || continue
+    [ -n "$geom" ] || continue
+    [ -n "$title" ] || continue
+
+    type=$(printf '%s\n' "$props" | sed -En 's/^_NET_WM_WINDOW_TYPE\(ATOM\) = ?(.*)$/\1/p')
+    should_skip_type "$type" && continue
+
+    state=$(printf '%s\n' "$props" | sed -En 's/^_NET_WM_STATE\(ATOM\) = ?(.*)$/\1/p')
+    hidden=false
+    [[ "$state" == *"_NET_WM_STATE_HIDDEN"* ]] && hidden=true
+    [[ "$hidden" == true ]] && continue
+
+    class_line=$(printf '%s\n' "$props" | sed -En 's/^WM_CLASS\(STRING\) = (.*)$/\1/p')
+    instance=$(printf '%s\n' "$class_line" | sed -En 's/^"([^"]*)".*/\1/p')
+    class=$(printf '%s\n' "$class_line" | sed -En 's/^"[^"]*", "([^"]*)".*/\1/p')
+    [ -n "$class" ] || class="$instance"
+
+    desktop=$(printf '%s\n' "$props" | sed -En 's/^_NET_WM_DESKTOP\(CARDINAL\) = ([0-9]+)$/\1/p')
+    pid=$(printf '%s\n' "$props" | sed -En 's/^_NET_WM_PID\(CARDINAL\) = ([0-9]+)$/\1/p')
+
+    maximized=false
+    [[ "$state" == *"_NET_WM_STATE_MAXIMIZED_VERT"* && "$state" == *"_NET_WM_STATE_MAXIMIZED_HORZ"* ]] && maximized=true
+    fullscreen=false
+    [[ "$state" == *"_NET_WM_STATE_FULLSCREEN"* ]] && fullscreen=true
+
+    WINDOW= X= Y= WIDTH= HEIGHT= SCREEN=
+    eval "$geom"
+
+    desktop=${desktop:--1}
+    pid=${pid:-0}
+
+    jq -cn \
+      --arg window_id "$wid" \
+      --arg class "$class" \
+      --arg instance "$instance" \
+      --arg title "$title" \
+      --arg type "$type" \
+      --arg state "$state" \
+      --argjson desktop "$desktop" \
+      --argjson pid "$pid" \
+      --argjson x "$X" \
+      --argjson y "$Y" \
+      --argjson width "$WIDTH" \
+      --argjson height "$HEIGHT" \
+      --argjson screen "$SCREEN" \
+      --argjson maximized "$maximized" \
+      --argjson fullscreen "$fullscreen" \
+      '{
+        window_id: $window_id,
+        class: $class,
+        instance: $instance,
+        title: $title,
+        type: $type,
+        state: $state,
+        desktop: $desktop,
+        pid: $pid,
+        x: $x,
+        y: $y,
+        width: $width,
+        height: $height,
+        screen: $screen,
+        maximized: $maximized,
+        fullscreen: $fullscreen
+      }' >>"$tmp"
+  done < <(window_ids)
+
+  jq -sc . "$tmp"
+  rm -f "$tmp"
+}
+
+save_layout() {
+  local name="${1:-default}"
+  local file current windows_json count
+
+  mkdir -p "$STATE_DIR"
+  file=$(layout_file "$name")
+  current=$(current_desktop)
+  current=${current:-0}
+  windows_json=$(collect_windows_json)
+
+  jq -cn \
+    --arg name "$name" \
+    --arg created_at "$(date -Iseconds)" \
+    --arg host "$(hostname)" \
+    --arg display "${DISPLAY:-}" \
+    --arg session_type "${XDG_SESSION_TYPE:-x11}" \
+    --argjson current_desktop "$current" \
+    --argjson windows "$windows_json" \
+    '{
+      name: $name,
+      created_at: $created_at,
+      host: $host,
+      display: $display,
+      session_type: $session_type,
+      current_desktop: $current_desktop,
+      windows: $windows
+    }' >"$file"
+
+  count=$(jq '.windows | length' "$file")
+  printf 'Saved %s windows to %s\n' "$count" "$file"
+}
+
+find_candidate() {
+  local saved_json="$1"
+  local orig_id class title candidate
+
+  orig_id=$(printf '%s\n' "$saved_json" | jq -r '.window_id')
+  class=$(printf '%s\n' "$saved_json" | jq -r '.class')
+  title=$(printf '%s\n' "$saved_json" | jq -r '.title')
+  CANDIDATE_ID=''
+
+  if window_exists "$orig_id"; then
+    candidate=$(printf '%s\n' "$USED_WINDOWS_JSON" | jq -r --arg id "$orig_id" 'if index($id) then "" else $id end')
+    if [ -n "$candidate" ]; then
+      CANDIDATE_ID="$candidate"
+      CANDIDATE_REASON='window_id'
+      return 0
+    fi
+  fi
+
+  candidate=$(
+    printf '%s\n' "$CURRENT_WINDOWS_JSON" | jq -r \
+      --arg class "$class" \
+      --arg title "$title" \
+      --argjson used "$USED_WINDOWS_JSON" \
+      '[
+         .[]
+         | select(.class == $class and .title == $title)
+         | select(.window_id as $id | ($used | index($id) | not))
+       ][0].window_id // empty'
+  )
+  if [ -n "$candidate" ]; then
+    CANDIDATE_ID="$candidate"
+    CANDIDATE_REASON='class+title'
+    return 0
+  fi
+
+  candidate=$(
+    printf '%s\n' "$CURRENT_WINDOWS_JSON" | jq -r \
+      --arg class "$class" \
+      --argjson used "$USED_WINDOWS_JSON" \
+      '[
+         .[]
+         | select(.class == $class)
+         | select(.window_id as $id | ($used | index($id) | not))
+       ] | if length == 1 then .[0].window_id else empty end'
+  )
+  if [ -n "$candidate" ]; then
+    CANDIDATE_ID="$candidate"
+    CANDIDATE_REASON='class'
+    return 0
+  fi
+
+  CANDIDATE_ID=''
+  CANDIDATE_REASON=''
+  return 1
+}
+
+restore_window() {
+  local id="$1"
+  local saved_json="$2"
+  local dry_run="${3:-false}"
+  local desktop x y width height maximized title class
+
+  title=$(printf '%s\n' "$saved_json" | jq -r '.title')
+  class=$(printf '%s\n' "$saved_json" | jq -r '.class')
+  desktop=$(printf '%s\n' "$saved_json" | jq -r '.desktop')
+  x=$(printf '%s\n' "$saved_json" | jq -r '.x')
+  y=$(printf '%s\n' "$saved_json" | jq -r '.y')
+  width=$(printf '%s\n' "$saved_json" | jq -r '.width')
+  height=$(printf '%s\n' "$saved_json" | jq -r '.height')
+  maximized=$(printf '%s\n' "$saved_json" | jq -r '.maximized')
+
+  if [ "$dry_run" = "true" ]; then
+    printf 'Would restore %s [%s] -> %s (%s)\n' "$title" "$class" "$id" "$CANDIDATE_REASON"
+    return 0
+  fi
+
+  xdotool windowunmaximize --sync "$id" >/dev/null 2>&1 || true
+  if [ "$desktop" -ge 0 ]; then
+    xdotool set_desktop_for_window "$id" "$desktop" >/dev/null 2>&1 || true
+  fi
+  xdotool windowmove --sync "$id" "$x" "$y" >/dev/null 2>&1 || true
+  xdotool windowsize --sync "$id" "$width" "$height" >/dev/null 2>&1 || true
+  if [ "$maximized" = "true" ]; then
+    xdotool windowmaximize --sync "$id" >/dev/null 2>&1 || true
+  fi
+
+  printf 'Restored %s [%s] -> %s (%s)\n' "$title" "$class" "$id" "$CANDIDATE_REASON"
+}
+
+restore_layout() {
+  local name="${1:-default}"
+  local dry_run="${2:-false}"
+  local file row saved_json candidate title class
+  local restored=0 missing=0
+
+  file=$(layout_file "$name")
+  [ -f "$file" ] || die "Layout not found: $file"
+
+  CURRENT_WINDOWS_JSON=$(collect_windows_json)
+  USED_WINDOWS_JSON='[]'
+
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+
+    saved_json=$(printf '%s' "$row" | base64 --decode)
+    title=$(printf '%s\n' "$saved_json" | jq -r '.title')
+    class=$(printf '%s\n' "$saved_json" | jq -r '.class')
+
+    if ! find_candidate "$saved_json"; then
+      printf 'No match for %s [%s]\n' "$title" "$class" >&2
+      missing=$((missing + 1))
+      continue
+    fi
+    candidate="$CANDIDATE_ID"
+
+    restore_window "$candidate" "$saved_json" "$dry_run"
+    USED_WINDOWS_JSON=$(printf '%s\n' "$USED_WINDOWS_JSON" | jq -c --arg id "$candidate" '. + [$id]')
+    restored=$((restored + 1))
+  done < <(jq -r '.windows[] | @base64' "$file")
+
+  if [ "$dry_run" = "true" ]; then
+    printf 'Dry run matched %s window(s); %s unmatched.\n' "$restored" "$missing"
+  else
+    printf 'Restored %s window(s); %s unmatched.\n' "$restored" "$missing"
+  fi
+}
+
+list_layouts() {
+  mkdir -p "$STATE_DIR"
+  shopt -s nullglob
+  local files=("$STATE_DIR"/*.json)
+  local file
+
+  if [ ${#files[@]} -eq 0 ]; then
+    printf 'No saved layouts in %s\n' "$STATE_DIR"
+    return 0
+  fi
+
+  for file in "${files[@]}"; do
+    basename "${file%.json}"
+  done | sort
+}
+
+show_path() {
+  printf '%s\n' "$(layout_file "${1:-default}")"
+}
+
+main() {
+  require_prereqs
+
+  case "${1:-}" in
+    save)
+      shift
+      save_layout "${1:-default}"
+      ;;
+    restore)
+      shift
+      if [ "${1:-}" = "--dry-run" ]; then
+        shift
+        restore_layout "${1:-default}" true
+      else
+        restore_layout "${1:-default}" false
+      fi
+      ;;
+    list)
+      shift
+      list_layouts
+      ;;
+    path)
+      shift
+      show_path "${1:-default}"
+      ;;
+    -h|--help|help|'')
+      usage
+      ;;
+    *)
+      usage >&2
+      die "Unknown command: $1"
+      ;;
+  esac
+}
+
+main "$@"
