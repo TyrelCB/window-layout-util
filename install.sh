@@ -5,6 +5,7 @@ REPO_RAW_BASE="https://raw.githubusercontent.com/TyrelCB/window-layout-util/main
 INSTALL_DIR="${HOME}/.local/bin"
 TARGET="${INSTALL_DIR}/window-layout"
 TMP_FILE="$(mktemp)"
+BASHRC="${HOME}/.bashrc"
 
 cleanup() {
   rm -f "$TMP_FILE"
@@ -27,20 +28,57 @@ fetch() {
   exit 1
 }
 
+write_wrapper() {
+  name="$1"
+  subcommand="$2"
+  wrapper_path="${INSTALL_DIR}/${name}"
+
+  cat > "$wrapper_path" <<EOF
+#!/bin/sh
+exec "${TARGET}" ${subcommand} "\$@"
+EOF
+  chmod +x "$wrapper_path"
+}
+
+ensure_bashrc_path() {
+  [ -f "$BASHRC" ] || : > "$BASHRC"
+
+  if grep -Fq '# >>> window-layout >>>' "$BASHRC"; then
+    return 0
+  fi
+
+  cat >> "$BASHRC" <<'EOF'
+
+# >>> window-layout >>>
+if [ -d "$HOME/.local/bin" ]; then
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+# <<< window-layout <<<
+EOF
+}
+
 mkdir -p "$INSTALL_DIR"
 fetch "${REPO_RAW_BASE}/window-layout" "$TMP_FILE"
 chmod +x "$TMP_FILE"
 mv "$TMP_FILE" "$TARGET"
+write_wrapper "wl-save" "save"
+write_wrapper "wl-restore" "restore"
+write_wrapper "wl-list" "list"
+write_wrapper "wl-path" "path"
 
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*)
     ;;
   *)
+    ensure_bashrc_path
     echo "Installed to ${TARGET}"
-    echo "Add ${INSTALL_DIR} to PATH if needed:"
+    echo "Created helper commands: wl-save, wl-restore, wl-list, wl-path"
+    echo "Added ${INSTALL_DIR} to ${BASHRC} for future bash sessions."
+    echo "Run this now to use the commands immediately:"
     echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
     exit 0
     ;;
 esac
 
 echo "Installed to ${TARGET}"
+echo "Created helper commands: wl-save, wl-restore, wl-list, wl-path"
