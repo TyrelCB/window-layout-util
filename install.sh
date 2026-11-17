@@ -61,6 +61,9 @@ mkdir -p "$INSTALL_DIR"
 fetch "${REPO_RAW_BASE}/window-layout" "$TMP_FILE"
 chmod +x "$TMP_FILE"
 mv "$TMP_FILE" "$TARGET"
+fetch "${REPO_RAW_BASE}/wl-collapse" "$TMP_FILE"
+chmod +x "$TMP_FILE"
+mv "$TMP_FILE" "${INSTALL_DIR}/wl-collapse"
 write_wrapper "wl-save" "save"
 write_wrapper "wl-restore" "restore"
 write_wrapper "wl-list" "list"
@@ -72,7 +75,7 @@ case ":${PATH}:" in
   *)
     ensure_bashrc_path
     echo "Installed to ${TARGET}"
-    echo "Created helper commands: wl-save, wl-restore, wl-list, wl-path"
+    echo "Created helper commands: wl-save, wl-restore, wl-list, wl-path, wl-collapse"
     echo "Added ${INSTALL_DIR} to ${BASHRC} for future bash sessions."
     echo "Run this now to use the commands immediately:"
     echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
@@ -81,4 +84,4 @@ case ":${PATH}:" in
 esac
 
 echo "Installed to ${TARGET}"
-echo "Created helper commands: wl-save, wl-restore, wl-list, wl-path"
+echo "Created helper commands: wl-save, wl-restore, wl-list, wl-path, wl-collapse"

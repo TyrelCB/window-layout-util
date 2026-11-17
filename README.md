@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/TyrelCB/window-layout-util/main/ins
 The installer:
 
 - installs `window-layout` into `~/.local/bin`
-- creates helper commands `wl-save`, `wl-restore`, `wl-list`, and `wl-path`
+- creates helper commands `wl-save`, `wl-restore`, `wl-list`, `wl-path`, and `wl-collapse`
 - adds `~/.local/bin` to `~/.bashrc` if needed
 
 ## Requirements
@@ -36,6 +36,7 @@ wl-save workday
 wl-restore workday
 wl-list
 wl-path workday
+wl-collapse
 ```
 
 Saved layouts default to:
@@ -45,6 +46,7 @@ Saved layouts default to:
 ```
 
 ## Notes
+- Run `wl-collapse` after switching back with a KVM to gather windows onto the current workspace. Windows visible on every workspace stay pinned.
 
 - Matching prefers the original X11 window id, then falls back to class and title.
 - Layouts include windows across workspaces and restore them to their saved workspace when possible.

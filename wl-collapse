@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+current=$(xdotool get_desktop)
+clients=$(xprop -root _NET_CLIENT_LIST)
+if [[ $clients != *'# '* ]]; then
+  [[ $clients == '_NET_CLIENT_LIST(WINDOW): window id #' ]] && exit 0
+  printf 'Could not read the X11 window list.\n' >&2
+  exit 1
+fi
+clients=${clients#*# }
+read -ra windows <<< "${clients//,/ }"
+status=0
+for window in "${windows[@]}"; do
+  desktop=$(xdotool get_desktop_for_window "$window") || { status=1; continue; }
+  case "$desktop" in
+    "$current"|-1|4294967295) continue ;;
+  esac
+  xdotool set_desktop_for_window "$window" "$current" || status=1
+done
+exit "$status"
