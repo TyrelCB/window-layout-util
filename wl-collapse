@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Work from non-session shells (ssh, cron, agents): fall back to the
+# desktop's primary display and our own Xauthority if neither is set.
+if [[ -z "${DISPLAY:-}" ]]; then
+  for cand in :0 :1; do
+    if [[ -S "/tmp/.X11-unix/X${cand#:}" ]]; then
+      export DISPLAY="$cand"
+      break
+    fi
+  done
+fi
+if [[ -n "${DISPLAY:-}" && -z "${XAUTHORITY:-}" ]]; then
+  for cand in "$HOME/.Xauthority" "/run/user/$(id -u)/gdm/Xauthority"; do
+    if [[ -f "$cand" ]]; then
+      export XAUTHORITY="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "${DISPLAY:-}" ]]; then
+  printf 'wl-collapse: no X11 DISPLAY found (set DISPLAY).\n' >&2
+  exit 1
+fi
+if ! xprop -root _NET_CLIENT_LIST >/dev/null 2>&1; then
+  printf 'wl-collapse: cannot reach X display %s (XAUTHORITY=%s).\n' \
+    "$DISPLAY" "${XAUTHORITY:-unset}" >&2
+  exit 1
+fi
+
 current=$(xdotool get_desktop)
 clients=$(xprop -root _NET_CLIENT_LIST)
 if [[ $clients != *'# '* ]]; then
